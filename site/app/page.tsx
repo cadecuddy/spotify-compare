@@ -135,7 +135,7 @@ export default function HomePage() {
       <div className="flex items-center space-x-2">
         <input
           type="text"
-          className="border p-2 rounded"
+          className="border p-2 rounded text-black"
           placeholder="Enter Spotify User ID"
           value={userIdInput}
           onChange={(e) => setUserIdInput(e.target.value)}

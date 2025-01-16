@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import pLimit from "p-limit";
+import redisClient, { connectRedis } from "../../lib/redis";
 
 interface Track {
     id: string;
@@ -16,17 +17,32 @@ interface TrackPage {
     next: string | null;
 }
 
+interface PlaylistInfo {
+    id: string;
+    name: string;
+}
+
 const limit = pLimit(2);
 
 export async function GET(request: NextRequest) {
     const userId = request.nextUrl.searchParams.get("userId");
     const accessToken = request.cookies.get("accessToken");
 
-    if (userId == undefined) {
+    if (!userId) {
         return Response.json(`Error fetching user library for ${userId}`);
     }
 
     try {
+        await connectRedis();
+
+        const cacheKey = `spotifyTrackMap:${userId}`;
+        const cached = await redisClient.get(cacheKey);
+
+        if (cached) {
+            console.log(`Cache hit for user: ${userId}`);
+            return new Response(cached, { status: 200 });
+        }
+
         const userPlaylists = await getAllUserPlaylists(userId, accessToken?.value);
 
         const trackMap: Record<
@@ -58,6 +74,11 @@ export async function GET(request: NextRequest) {
             });
         });
 
+        const dataToCache = JSON.stringify(trackMap);
+        await redisClient.set(cacheKey, dataToCache, {
+            EX: 900,
+        });
+
         return Response.json(trackMap);
     } catch (error) {
         console.error("Error fetching playlists:", error);
@@ -72,12 +93,25 @@ async function getTracksFromPlaylist(
     const playlistTracksUri = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?fields=next%2Citems%28track%28id%2C+name%29%29&limit=50`;
     const tracks: Track[] = [];
 
-    try {
-        let response = await fetch(playlistTracksUri, {
+    let response = await fetch(playlistTracksUri, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    let data: TrackPage = await response.json();
+    tracks.push(
+        ...data.items
+            .filter((item) => item.track)
+            .map((item) => ({
+                id: item.track.id,
+                name: item.track.name,
+            }))
+    );
+
+    while (data.next) {
+        response = await fetch(data.next, {
             headers: { Authorization: `Bearer ${accessToken}` },
         });
-        let data: TrackPage = await response.json();
-
+        data = await response.json();
         tracks.push(
             ...data.items
                 .filter((item) => item.track)
@@ -86,65 +120,41 @@ async function getTracksFromPlaylist(
                     name: item.track.name,
                 }))
         );
-
-        // Keep fetching while there is a next
-        while (data.next) {
-            response = await fetch(data.next, {
-                headers: { Authorization: `Bearer ${accessToken}` },
-            });
-            data = await response.json();
-            tracks.push(
-                ...data.items
-                    .filter((item) => item.track)
-                    .map((item) => ({
-                        id: item.track.id,
-                        name: item.track.name,
-                    }))
-            );
-        }
-
-        return tracks;
-    } catch (error) {
-        throw error;
     }
+
+    return tracks;
 }
 
 async function getAllUserPlaylists(
     userId: string,
     accessToken: string | undefined
-): Promise<Array<{ id: string; name: string }>> {
+): Promise<PlaylistInfo[]> {
     const userPlaylistUri = `https://api.spotify.com/v1/users/${userId}/playlists?limit=50&offset=0`;
     const allPlaylists: SpotifyApi.PlaylistObjectSimplified[] = [];
 
-    try {
-        let response = await fetch(userPlaylistUri, {
+    let response = await fetch(userPlaylistUri, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    let data: SpotifyApi.PagingObject<SpotifyApi.PlaylistObjectSimplified> = await response.json();
+    allPlaylists.push(...data.items);
+
+    while (data.next) {
+        response = await fetch(data.next, {
             headers: { Authorization: `Bearer ${accessToken}` },
         });
-        let data: SpotifyApi.PagingObject<SpotifyApi.PlaylistObjectSimplified> =
-            await response.json();
-
+        data = await response.json();
         allPlaylists.push(...data.items);
-
-        while (data.next) {
-            response = await fetch(data.next, {
-                headers: { Authorization: `Bearer ${accessToken}` },
-            });
-            data = await response.json();
-            allPlaylists.push(...data.items);
-        }
-
-        const userCreatedPlaylists = allPlaylists.filter(
-            (playlist) =>
-                playlist.public &&
-                playlist.owner.uri !== "spotify:user:spotify" &&
-                playlist.tracks.total > 0
-        );
-
-        return userCreatedPlaylists.map((p) => ({
-            id: p.id,
-            name: p.name,
-        }));
-    } catch (error) {
-        throw error;
     }
+
+    const userCreatedPlaylists = allPlaylists.filter(
+        (playlist) =>
+            playlist.public &&
+            playlist.owner.uri !== "spotify:user:spotify" &&
+            playlist.tracks.total > 0
+    );
+
+    return userCreatedPlaylists.map((p) => ({
+        id: p.id,
+        name: p.name,
+    }));
 }
